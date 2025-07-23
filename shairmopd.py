@@ -64,6 +64,7 @@ async def listen_to_dbus():
 # ----- Main -----
 async def main():
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+    log.info('shairmopd version ' + __version__)
     await asyncio.gather(
         listen_to_mopidy(),
         listen_to_dbus()
