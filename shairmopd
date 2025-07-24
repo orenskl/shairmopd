@@ -9,68 +9,85 @@ from dbus_next.constants import MessageType
 from dbus_next.constants import BusType
 from dbus_next import Message
 from dbus_next.message import MessageType
+import requests
 
-MOPIDY_WS_URL = "ws://localhost:6680/mopidy/ws/"
+MOPIDY_ADDRESS         = 'localhost:6680/mopidy/'
+MOPIDY_WS_URL          = 'ws://'   + MOPIDY_ADDRESS + 'ws/'
+MOPIDY_API_URL         = 'http://' + MOPIDY_ADDRESS + 'rpc'
+SHAIRPORT_SYNC_SERVICE = 'org.gnome.ShairportSync'
+SHAIRPORT_SYNC_PATH    = '/org/gnome/ShairportSync'
+DBUS_PROP_INTERFACE    = 'org.freedesktop.DBus.Properties'
+
 log = logging.getLogger(__name__)
-__version__ = "0.1.0"
+__version__ = '0.1.0'
 
 # ----- Mopidy WebSocket Listener -----
 async def listen_to_mopidy():
     try:
         ws = await websocket_connect(MOPIDY_WS_URL)
-        log.info("Connected to Mopidy WebSocket")
+        log.info('Connected to Mopidy WebSocket')
         while True:
             msg = await ws.read_message()
             if msg is None:
-                log.info("Mopidy WebSocket closed")
+                log.info('Mopidy WebSocket closed')
                 break
             data = json.loads(msg)
-            if "event" in data:
-                if data['event'] == "playback_state_changed":
-                    if data['old_state'] == "stopped" and data['new_state'] == "playing":
-                        log.info("Mopidy playback started")
+            if 'event' in data:
+                if data['event'] == 'playback_state_changed':
+                    if data['old_state'] == 'stopped' and data['new_state'] == 'playing':
+                        log.info('Mopidy playback started')
+                        # Stop ShairportSync playback
                         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
                         # Create the method call message
                         msg = Message(
-                            destination='org.gnome.ShairportSync',
-                            path='/org/gnome/ShairportSync',
-                            interface='org.gnome.ShairportSync',
+                            destination=SHAIRPORT_SYNC_SERVICE,
+                            path=SHAIRPORT_SYNC_PATH,
+                            interface=SHAIRPORT_SYNC_SERVICE,
                             member='DropSession',
                             signature='',
                             body=[],
                             message_type=MessageType.METHOD_CALL,
                         )
                         reply = await bus.call(msg)
-                        log.info(reply.body)
+                        log.info("Reply = " + str(reply.body))
     except Exception as e:
-        log.info(f"Mopidy connection failed: {e}")
+        log.info(f'Mopidy connection failed: {e}')
 
 # ----- D-Bus System Event Listener -----
 async def listen_to_dbus():
+
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
-    def handle_signal(msg):
-        if msg.message_type != MessageType.SIGNAL:
-            return
-        log.info(f"D-Bus Signal: {msg.interface}.{msg.member}")
-        if msg.body:
-            log.info(f"Body: {msg.body}")
+    # Define a handler for the PropertiesChanged signal
+    def on_properties_changed(interface_name, changed_properties, invalidated_properties):
+        for prop, value in changed_properties.items():
+            if prop == 'PlayerState':
+                if value.value == 'Playing':
+                    log.info('Shairport Sync playback started')
+                    # Stop Mopidy playback
+                    headers = {'Content-Type': 'application/json'}
+                    payload = {'jsonrpc': '2.0', 'id': 1, 'method': 'core.playback.stop'}
+                    response = requests.post(MOPIDY_API_URL, headers=headers, json=payload)
+                    log.info("Status = " + str(response.status_code))
 
-    bus.add_message_handler(handle_signal)
+    # Introspect the object to get its interface
+    introspection = await bus.introspect(SHAIRPORT_SYNC_SERVICE, SHAIRPORT_SYNC_PATH)
+    obj = bus.get_proxy_object(SHAIRPORT_SYNC_SERVICE, SHAIRPORT_SYNC_PATH, introspection)
+    props_iface = obj.get_interface(DBUS_PROP_INTERFACE)
 
-    await bus.introspect('org.gnome.ShairportSync', '/org/gnome/ShairportSync')
-    await bus.request_name('org.freedesktop.shairmopd')
+    # Attach signal handler
+    props_iface.on_properties_changed(on_properties_changed)
 
-    log.info("Listening for D-Bus system signals...")
-
+    log.info('Listening for D-Bus system property changes...')
+    
 # ----- Main -----
 async def main():
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     log.info('shairmopd version ' + __version__)
     await asyncio.gather(
         listen_to_mopidy(),
         listen_to_dbus()
     )
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
