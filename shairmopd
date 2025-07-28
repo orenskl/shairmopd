@@ -14,45 +14,69 @@ import requests
 MOPIDY_ADDRESS         = 'localhost:6680/mopidy/'
 MOPIDY_WS_URL          = 'ws://'   + MOPIDY_ADDRESS + 'ws/'
 MOPIDY_API_URL         = 'http://' + MOPIDY_ADDRESS + 'rpc'
+MOPIDY_RETRY_DELAY     = 2
+MOPIDY_MAX_RETRIES     = 10
 SHAIRPORT_SYNC_SERVICE = 'org.gnome.ShairportSync'
 SHAIRPORT_SYNC_PATH    = '/org/gnome/ShairportSync'
 DBUS_PROP_INTERFACE    = 'org.freedesktop.DBus.Properties'
 
 log = logging.getLogger(__name__)
-__version__ = '0.1.0'
+__version__ = '0.0.1'
+
+# ----- Check if Mopidy playback has started -----
+def is_mopidy_playback_started(msg):
+    data = json.loads(msg)
+    if 'event' in data:
+        if data['event'] == 'playback_state_changed':
+            if data['old_state'] == 'stopped' and data['new_state'] == 'playing':
+                return True
+    return False
+
+# ----- Connect to Mopidy WebSocket -----
+async def connect_to_mopidy():
+    attempts = 0
+    while attempts < MOPIDY_MAX_RETRIES:
+        try:
+            ws = await websocket_connect(MOPIDY_WS_URL)
+            log.info('Connected to Mopidy WebSocket')
+            return ws
+        except Exception as e:
+            attempts += 1
+            log.error(f'WebSocket connection failed: {e}. Retrying in {MOPIDY_RETRY_DELAY} seconds...')
+            await asyncio.sleep(MOPIDY_RETRY_DELAY)
+    log.error(f'Failed to connect to Mopidy WebSocket after {MOPIDY_MAX_RETRIES} attempts.')
+    return None
 
 # ----- Mopidy WebSocket Listener -----
 async def listen_to_mopidy():
-    try:
-        ws = await websocket_connect(MOPIDY_WS_URL)
-        log.info('Connected to Mopidy WebSocket')
+    ws = await connect_to_mopidy()
+    if ws:
         while True:
-            msg = await ws.read_message()
+            try:
+                msg = await ws.read_message()
+            except Exception as e:
+                log.info(f'Mopidy connection failed: {e}')
+                break
             if msg is None:
                 log.info('Mopidy WebSocket closed')
                 break
-            data = json.loads(msg)
-            if 'event' in data:
-                if data['event'] == 'playback_state_changed':
-                    if data['old_state'] == 'stopped' and data['new_state'] == 'playing':
-                        log.info('Mopidy playback started')
-                        # Stop ShairportSync playback
-                        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-                        # Create the method call message
-                        msg = Message(
-                            destination=SHAIRPORT_SYNC_SERVICE,
-                            path=SHAIRPORT_SYNC_PATH,
-                            interface=SHAIRPORT_SYNC_SERVICE,
-                            member='DropSession',
-                            signature='',
-                            body=[],
-                            message_type=MessageType.METHOD_CALL,
-                        )
-                        reply = await bus.call(msg)
-                        log.info("Reply = " + str(reply.body))
-    except Exception as e:
-        log.info(f'Mopidy connection failed: {e}')
-
+            if is_mopidy_playback_started(msg):
+                log.info('Mopidy playback started')
+                # Stop ShairportSync playback
+                bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+                # Create the method call message
+                msg = Message(
+                    destination=SHAIRPORT_SYNC_SERVICE,
+                    path=SHAIRPORT_SYNC_PATH,
+                    interface=SHAIRPORT_SYNC_SERVICE,
+                    member='DropSession',
+                    signature='',
+                    body=[],
+                    message_type=MessageType.METHOD_CALL,
+                )
+                reply = await bus.call(msg)
+                log.info("Reply = " + str(reply.body))
+        
 # ----- D-Bus System Event Listener -----
 async def listen_to_dbus():
 
